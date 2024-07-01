@@ -56,14 +56,17 @@ The changes are relative to the previous release, unless the baseline is specifi
 * Add AVIF_CHROMA_SAMPLE_POSITION_RESERVED to avifChromaSamplePosition enum.
 
 ### Changed since 1.0.0
-* Update aom.cmd: v3.9.0
-* Update dav1d.cmd: 1.4.2
+* Update aom.cmd: v3.9.1
+* Update avm.cmd: research-v7.0.1
+* Update dav1d.cmd: 1.4.3
 * Update libgav1.cmd: v0.19.0
-* Update libxml2.cmd: v2.12.6
+* Update libjpeg.cmd: v3.0.3
+* Update libxml2.cmd: v2.12.7
 * Update libyuv.cmd: a6a2ec65
+* Update mp4box.sh: v2.4.0
 * Update rav1e.cmd: v0.7.1
-* Update svt.cmd/svt.sh: v2.1.0
-* Update zlibpng.cmd: zlib 1.3 and libpng 1.6.40
+* Update svt.cmd/svt.sh: v2.1.1
+* Update zlibpng.cmd: zlib 1.3.1 and libpng 1.6.40
 * AVIF sequences encoded by libavif will now also have the "avio" brand when
   there is at least one track made only of AV1 keyframes.
 * Fix SVT-AV1 codec interface which was not setting video range at encoding.

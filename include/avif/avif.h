@@ -306,8 +306,13 @@ typedef enum avifChromaSamplePosition
 
 typedef enum avifRange
 {
-    AVIF_RANGE_LIMITED = 0,
-    AVIF_RANGE_FULL = 1
+    // avifRange is only applicable to YUV planes. RGB and alpha planes are always full range.
+    AVIF_RANGE_LIMITED = 0, /**<- Y  [16..235],  UV  [16..240]  (bit depth 8) */
+                            /**<- Y  [64..940],  UV  [64..960]  (bit depth 10) */
+                            /**<- Y [256..3760], UV [256..3840] (bit depth 12) */
+    AVIF_RANGE_FULL = 1     /**<- [0..255]  (bit depth 8) */
+                            /**<- [0..1023] (bit depth 10) */
+                            /**<- [0..4095] (bit depth 12) */
 } avifRange;
 
 // ---------------------------------------------------------------------------
@@ -625,16 +630,13 @@ typedef struct avifGainMapMetadata
     //
     // If 'H' is the display's current log2-encoded HDR capacity (HDR to SDR ratio),
     // then the weight 'w' to apply the gain map is computed as follows:
-    // f = clamp((H - hdrCapacityMin) /
-    //           (hdrCapacityMax - hdrCapacityMin), 0, 1);
-    // w = backwardDirection ? f * -1 : f;
+    // f = clamp((H - baseHdrHeadroom) /
+    //           (alternateHdrHeadroom - baseHdrHeadroom), 0, 1);
+    // w = sign(alternateHdrHeadroom - baseHdrHeadroom) * f
     uint32_t baseHdrHeadroomN;
     uint32_t baseHdrHeadroomD;
     uint32_t alternateHdrHeadroomN;
     uint32_t alternateHdrHeadroomD;
-
-    // True if the gain map should be applied in reverse, see weight formula above.
-    avifBool backwardDirection;
 
     // True if tone mapping should be performed in the color space of the
     // base image. If false, the color space of the alternate image should
@@ -697,7 +699,6 @@ typedef struct avifGainMapMetadataDouble
     double alternateOffset[3];
     double baseHdrHeadroom;
     double alternateHdrHeadroom;
-    avifBool backwardDirection;
     avifBool useBaseColorSpace;
 } avifGainMapMetadataDouble;
 
@@ -794,6 +795,7 @@ typedef struct avifImage
     //
     // To encode any of these boxes, set the values in the associated box, then enable the flag in
     // transformFlags. On decode, only honor the values in boxes with the associated transform flag set.
+    // These also apply to gainMap->image, if any.
     avifTransformFlags transformFlags;
     avifPixelAspectRatioBox pasp;
     avifCleanApertureBox clap;
@@ -811,6 +813,7 @@ typedef struct avifImage
 #if defined(AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP)
     // Gain map image and metadata. NULL if no gain map is present.
     // Owned by the avifImage and gets freed when calling avifImageDestroy().
+    // gainMap->image->transformFlags is always AVIF_TRANSFORM_NONE.
     avifGainMap * gainMap;
 #endif
 } avifImage;

@@ -788,7 +788,7 @@ static void avifMetaDestroy(avifMeta * meta)
 static avifResult avifCheckItemID(const char * boxFourcc, uint32_t itemID, avifDiagnostics * diag)
 {
     if (itemID == 0) {
-        avifDiagnosticsPrintf(diag, "Box[%4s] has an invalid item ID [%u]", boxFourcc, itemID);
+        avifDiagnosticsPrintf(diag, "Box[%.4s] has an invalid item ID [%u]", boxFourcc, itemID);
         return AVIF_RESULT_BMFF_PARSE_FAILED;
     }
     return AVIF_RESULT_OK;
@@ -1426,6 +1426,7 @@ static avifResult avifDecoderGenerateImageGridTiles(avifDecoder * decoder, avifI
     // Count number of dimg for this item, bail out if it doesn't match perfectly
     unsigned int tilesAvailable = 0;
     avifDecoderItem * firstTileItem = NULL;
+    avifBool progressive = AVIF_TRUE;
     for (uint32_t i = 0; i < gridItem->meta->items.count; ++i) {
         avifDecoderItem * item = gridItem->meta->items.item[i];
         if (item->dimgForID != gridItem->id) {
@@ -1490,9 +1491,6 @@ static avifResult avifDecoderGenerateImageGridTiles(avifDecoder * decoder, avifI
             AVIF_CHECKERR(dstProp != NULL, AVIF_RESULT_OUT_OF_MEMORY);
             *dstProp = *srcProp;
 
-            if (itemCategory == AVIF_ITEM_COLOR && item->progressive) {
-                gridItem->progressive = AVIF_TRUE; // Propagate the progressive status to the top-level grid item.
-            }
         } else if (memcmp(item->type, firstTileItem->type, 4)) {
             // MIAF (ISO 23000-22:2019), Section 7.3.11.4.1:
             //   All input images of a grid image item shall use the same coding format [...]
@@ -1504,7 +1502,14 @@ static avifResult avifDecoderGenerateImageGridTiles(avifDecoder * decoder, avifI
                                   (const char *)firstTileItem->type);
             return AVIF_RESULT_INVALID_IMAGE_GRID;
         }
+        if (!item->progressive) {
+            progressive = AVIF_FALSE;
+        }
         ++tilesAvailable;
+    }
+    if (itemCategory == AVIF_ITEM_COLOR && progressive) {
+        // If all the items that make up the grid are progressive, then propagate that status to the top-level grid item.
+        gridItem->progressive = AVIF_TRUE;
     }
 
     if (tilesAvailable != grid->rows * grid->columns) {
@@ -1968,7 +1973,6 @@ static avifBool avifParseToneMappedImageBox(avifGainMapMetadata * metadata, cons
     uint8_t channelCount = (flags & 1) * 2 + 1;
     AVIF_ASSERT_OR_RETURN(channelCount == 1 || channelCount == 3);
     metadata->useBaseColorSpace = (flags & 2) != 0;
-    metadata->backwardDirection = (flags & 4) != 0;
     const avifBool useCommonDenominator = (flags & 8) != 0;
 
     if (useCommonDenominator) {
@@ -2257,12 +2261,12 @@ static avifBool avifParseCodecConfiguration(avifROStream * s, avifCodecConfigura
     uint32_t marker, version;
     AVIF_CHECK(avifROStreamReadBits(s, &marker, /*bitCount=*/1)); // unsigned int (1) marker = 1;
     if (!marker) {
-        avifDiagnosticsPrintf(diag, "%s contains illegal marker: [%u]", configPropName, marker);
+        avifDiagnosticsPrintf(diag, "%.4s contains illegal marker: [%u]", configPropName, marker);
         return AVIF_FALSE;
     }
     AVIF_CHECK(avifROStreamReadBits(s, &version, /*bitCount=*/7)); // unsigned int (7) version = 1;
     if (version != 1) {
-        avifDiagnosticsPrintf(diag, "%s contains illegal version: [%u]", configPropName, version);
+        avifDiagnosticsPrintf(diag, "%.4s contains illegal version: [%u]", configPropName, version);
         return AVIF_FALSE;
     }
 
@@ -3227,7 +3231,15 @@ static avifResult avifParseSampleDescriptionBox(avifSampleTable * sampleTable,
 {
     BEGIN_STREAM(s, raw, rawLen, diag, "Box[stsd]");
 
-    AVIF_CHECKERR(avifROStreamReadAndEnforceVersion(&s, 0), AVIF_RESULT_BMFF_PARSE_FAILED);
+    uint8_t version;
+    AVIF_CHECKERR(avifROStreamReadVersionAndFlags(&s, &version, NULL), AVIF_RESULT_BMFF_PARSE_FAILED);
+
+    // Section 8.5.2.3 of ISO/IEC 14496-12:
+    //   version is set to zero. A version number of 1 shall be treated as a version of 0.
+    if (version != 0 && version != 1) {
+        avifDiagnosticsPrintf(diag, "Box[stsd]: Expecting box version 0 or 1, got version %u", version);
+        return AVIF_RESULT_BMFF_PARSE_FAILED;
+    }
 
     uint32_t entryCount;
     AVIF_CHECKERR(avifROStreamReadU32(&s, &entryCount), AVIF_RESULT_BMFF_PARSE_FAILED); // unsigned int(32) entry_count;
@@ -3266,7 +3278,7 @@ static avifResult avifParseSampleTableBox(avifTrack * track, uint64_t rawOffset,
     if (track->sampleTable) {
         // A TrackBox may only have one SampleTable
         avifDiagnosticsPrintf(diag, "Duplicate Box[stbl] for a single track detected");
-        return AVIF_FALSE;
+        return AVIF_RESULT_BMFF_PARSE_FAILED;
     }
     track->sampleTable = avifSampleTableCreate();
     AVIF_CHECKERR(track->sampleTable != NULL, AVIF_RESULT_OUT_OF_MEMORY);
@@ -4342,6 +4354,17 @@ static avifResult avifDecoderPrepareSample(avifDecoder * decoder, avifDecodeSamp
     return AVIF_RESULT_OK;
 }
 
+// Returns AVIF_TRUE if the item should be skipped. Items should be skipped for one of the following reasons:
+//  * Size is 0.
+//  * Has an essential property that isn't supported by libavif.
+//  * Item is not a single image or a grid.
+//  * Item is a thumbnail.
+static avifBool avifDecoderItemShouldBeSkipped(const avifDecoderItem * item)
+{
+    return !item->size || item->hasUnsupportedEssentialProperty ||
+           (avifGetCodecType(item->type) == AVIF_CODEC_TYPE_UNKNOWN && memcmp(item->type, "grid", 4)) || item->thumbnailForID != 0;
+}
+
 avifResult avifDecoderParse(avifDecoder * decoder)
 {
     avifDiagnosticsClearError(&decoder->diag);
@@ -4371,16 +4394,7 @@ avifResult avifDecoderParse(avifDecoder * decoder)
     avifDecoderData * data = decoder->data;
     for (uint32_t itemIndex = 0; itemIndex < data->meta->items.count; ++itemIndex) {
         avifDecoderItem * item = data->meta->items.item[itemIndex];
-        if (!item->size) {
-            continue;
-        }
-        if (item->hasUnsupportedEssentialProperty) {
-            // An essential property isn't supported by libavif; ignore the item.
-            continue;
-        }
-        avifBool isGrid = (memcmp(item->type, "grid", 4) == 0);
-        if ((avifGetCodecType(item->type) == AVIF_CODEC_TYPE_UNKNOWN) && !isGrid) {
-            // probably exif or some other data
+        if (avifDecoderItemShouldBeSkipped(item)) {
             continue;
         }
 
@@ -4526,17 +4540,6 @@ static avifResult avifDecoderCreateCodecs(avifDecoder * decoder)
     return AVIF_RESULT_OK;
 }
 
-// Returns AVIF_TRUE if the item should be skipped. Items should be skipped for one of the following reasons:
-//  * Size is 0.
-//  * Has an essential property that isn't supported by libavif.
-//  * Item is not a single image or a grid.
-//  * Item is a thumbnail.
-static avifBool avifDecoderItemShouldBeSkipped(const avifDecoderItem * item)
-{
-    return !item->size || item->hasUnsupportedEssentialProperty ||
-           (avifGetCodecType(item->type) == AVIF_CODEC_TYPE_UNKNOWN && memcmp(item->type, "grid", 4)) || item->thumbnailForID != 0;
-}
-
 // Returns the primary color item if found, or NULL.
 static avifDecoderItem * avifMetaFindColorItem(avifMeta * meta)
 {
@@ -4669,6 +4672,48 @@ static avifResult avifMetaFindAlphaItem(avifMeta * meta,
     return AVIF_RESULT_OK;
 }
 
+// On success, this function returns AVIF_RESULT_OK and does the following:
+// * If a nclx property was found in |properties|:
+//   - Set |*colorPrimaries|, |*transferCharacteristics|, |*matrixCoefficients|
+//     and |*yuvRange|.
+//   - If cicpSet is not NULL, set |*cicpSet| to AVIF_TRUE.
+// This function fails if more than one nclx property is found in |properties|.
+// The output parameters may be populated even in case of failure and must be
+// ignored.
+static avifResult avifReadColorNclxProperty(const avifPropertyArray * properties,
+                                            avifColorPrimaries * colorPrimaries,
+                                            avifTransferCharacteristics * transferCharacteristics,
+                                            avifMatrixCoefficients * matrixCoefficients,
+                                            avifRange * yuvRange,
+                                            avifBool * cicpSet)
+{
+    avifBool colrNCLXSeen = AVIF_FALSE;
+    for (uint32_t propertyIndex = 0; propertyIndex < properties->count; ++propertyIndex) {
+        avifProperty * prop = &properties->prop[propertyIndex];
+        if (!memcmp(prop->type, "colr", 4) && prop->u.colr.hasNCLX) {
+            if (colrNCLXSeen) {
+                return AVIF_RESULT_BMFF_PARSE_FAILED;
+            }
+            colrNCLXSeen = AVIF_TRUE;
+            if (cicpSet != NULL) {
+                *cicpSet = AVIF_TRUE;
+            }
+            *colorPrimaries = prop->u.colr.colorPrimaries;
+            *transferCharacteristics = prop->u.colr.transferCharacteristics;
+            *matrixCoefficients = prop->u.colr.matrixCoefficients;
+            *yuvRange = prop->u.colr.range;
+        }
+    }
+    return AVIF_RESULT_OK;
+}
+
+// On success, this function returns AVIF_RESULT_OK and does the following:
+// * If a colr property was found in |properties|:
+//   - Read the icc data into |icc| from |io|.
+//   - Sets the CICP values as documented in avifReadColorNclxProperty().
+// This function fails if more than one icc or nclx property is found in
+// |properties|. The output parameters may be populated even in case of failure
+// and must be ignored (and the |icc| object may need to be freed).
 static avifResult avifReadColorProperties(avifIO * io,
                                           const avifPropertyArray * properties,
                                           avifRWData * icc,
@@ -4681,37 +4726,19 @@ static avifResult avifReadColorProperties(avifIO * io,
     // Find and adopt all colr boxes "at most one for a given value of colour type" (HEIF 6.5.5.1, from Amendment 3)
     // Accept one of each type, and bail out if more than one of a given type is provided.
     avifBool colrICCSeen = AVIF_FALSE;
-    avifBool colrNCLXSeen = AVIF_FALSE;
     for (uint32_t propertyIndex = 0; propertyIndex < properties->count; ++propertyIndex) {
         avifProperty * prop = &properties->prop[propertyIndex];
-
-        if (!memcmp(prop->type, "colr", 4)) {
-            if (prop->u.colr.hasICC) {
-                if (colrICCSeen) {
-                    return AVIF_RESULT_BMFF_PARSE_FAILED;
-                }
-                avifROData iccRead;
-                AVIF_CHECKRES(io->read(io, 0, prop->u.colr.iccOffset, prop->u.colr.iccSize, &iccRead));
-                colrICCSeen = AVIF_TRUE;
-                AVIF_CHECKRES(avifRWDataSet(icc, iccRead.data, iccRead.size));
+        if (!memcmp(prop->type, "colr", 4) && prop->u.colr.hasICC) {
+            if (colrICCSeen) {
+                return AVIF_RESULT_BMFF_PARSE_FAILED;
             }
-            if (prop->u.colr.hasNCLX) {
-                if (colrNCLXSeen) {
-                    return AVIF_RESULT_BMFF_PARSE_FAILED;
-                }
-                colrNCLXSeen = AVIF_TRUE;
-                if (cicpSet != NULL) {
-                    *cicpSet = AVIF_TRUE;
-                }
-                *colorPrimaries = prop->u.colr.colorPrimaries;
-                *transferCharacteristics = prop->u.colr.transferCharacteristics;
-                *matrixCoefficients = prop->u.colr.matrixCoefficients;
-                *yuvRange = prop->u.colr.range;
-            }
+            avifROData iccRead;
+            AVIF_CHECKRES(io->read(io, 0, prop->u.colr.iccOffset, prop->u.colr.iccSize, &iccRead));
+            colrICCSeen = AVIF_TRUE;
+            AVIF_CHECKRES(avifRWDataSet(icc, iccRead.data, iccRead.size));
         }
     }
-
-    return AVIF_RESULT_OK;
+    return avifReadColorNclxProperty(properties, colorPrimaries, transferCharacteristics, matrixCoefficients, yuvRange, cicpSet);
 }
 
 #if defined(AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP)
@@ -4832,6 +4859,20 @@ static avifResult avifDecoderFindGainMapItem(const avifDecoder * decoder,
             gainMap->altPlaneCount = pixiProp->u.pixi.planeCount;
             gainMap->altDepth = pixiProp->u.pixi.planeDepths[0];
         }
+
+        if (avifPropertyArrayFind(&toneMappedImageItemTmp->properties, "pasp") ||
+            avifPropertyArrayFind(&toneMappedImageItemTmp->properties, "clap") ||
+            avifPropertyArrayFind(&toneMappedImageItemTmp->properties, "irot") ||
+            avifPropertyArrayFind(&toneMappedImageItemTmp->properties, "imir")) {
+            // libavif requires the bitstream contain the same pasp, clap, irot, imir
+            // properties for both the base and gain map image items used as input to
+            // the tone-mapped derived image item. libavif also requires the tone-mapped
+            // derived image item itself not be associated with these properties. This is
+            // enforced at encoding. Other patterns are rejected at decoding.
+            avifDiagnosticsPrintf(data->diag,
+                                  "Box[tmap] 'pasp', 'clap', 'irot' and 'imir' properties must be associated with base and gain map items instead of 'tmap'");
+            return AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE;
+        }
     }
 
     if (decoder->enableDecodingGainMap) {
@@ -4840,21 +4881,54 @@ static avifResult avifDecoderFindGainMapItem(const avifDecoder * decoder,
         AVIF_CHECKERR(gainMap->image, AVIF_RESULT_OUT_OF_MEMORY);
 
         // Look for a colr nclx box. Other colr box types (e.g. ICC) are not supported.
-        for (uint32_t propertyIndex = 0; propertyIndex < gainMapItemTmp->properties.count; ++propertyIndex) {
-            avifProperty * prop = &gainMapItemTmp->properties.prop[propertyIndex];
-            if (!memcmp(prop->type, "colr", 4) && prop->u.colr.hasNCLX) {
-                gainMap->image->colorPrimaries = prop->u.colr.colorPrimaries;
-                gainMap->image->transferCharacteristics = prop->u.colr.transferCharacteristics;
-                gainMap->image->matrixCoefficients = prop->u.colr.matrixCoefficients;
-                gainMap->image->yuvRange = prop->u.colr.range;
-                break;
-            }
-        }
+        AVIF_CHECKRES(avifReadColorNclxProperty(&gainMapItemTmp->properties,
+                                                &gainMap->image->colorPrimaries,
+                                                &gainMap->image->transferCharacteristics,
+                                                &gainMap->image->matrixCoefficients,
+                                                &gainMap->image->yuvRange,
+                                                /*cicpSet=*/NULL));
     }
 
     // Only set the output parameters after everything has been validated.
     *toneMappedImageItem = toneMappedImageItemTmp;
     *gainMapItem = gainMapItemTmp;
+    return AVIF_RESULT_OK;
+}
+
+static avifResult aviDecoderCheckGainMapProperties(avifDecoder * decoder, const avifPropertyArray * gainMapProperties)
+{
+    const avifImage * image = decoder->image;
+    // libavif requires the bitstream contain the same 'pasp', 'clap', 'irot', 'imir'
+    // properties for both the base and gain map image items used as input to
+    // the tone-mapped derived image item. libavif also requires the tone-mapped
+    // derived image item itself not be associated with these properties. This is
+    // enforced at encoding. Other patterns are rejected at decoding.
+    const avifProperty * paspProp = avifPropertyArrayFind(gainMapProperties, "pasp");
+    if (!paspProp != !(image->transformFlags & AVIF_TRANSFORM_PASP) ||
+        (paspProp && (paspProp->u.pasp.hSpacing != image->pasp.hSpacing || paspProp->u.pasp.vSpacing != image->pasp.vSpacing))) {
+        avifDiagnosticsPrintf(&decoder->diag,
+                              "Pixel aspect ratio property mismatch between input items of tone-mapping derived image item");
+        return AVIF_RESULT_DECODE_GAIN_MAP_FAILED;
+    }
+    const avifProperty * clapProp = avifPropertyArrayFind(gainMapProperties, "clap");
+    if (!clapProp != !(image->transformFlags & AVIF_TRANSFORM_CLAP) ||
+        (clapProp && (clapProp->u.clap.widthN != image->clap.widthN || clapProp->u.clap.widthD != image->clap.widthD ||
+                      clapProp->u.clap.heightN != image->clap.heightN || clapProp->u.clap.heightD != image->clap.heightD ||
+                      clapProp->u.clap.horizOffN != image->clap.horizOffN || clapProp->u.clap.horizOffD != image->clap.horizOffD ||
+                      clapProp->u.clap.vertOffN != image->clap.vertOffN || clapProp->u.clap.vertOffD != image->clap.vertOffD))) {
+        avifDiagnosticsPrintf(&decoder->diag, "Clean aperture property mismatch between input items of tone-mapping derived image item");
+        return AVIF_RESULT_DECODE_GAIN_MAP_FAILED;
+    }
+    const avifProperty * irotProp = avifPropertyArrayFind(gainMapProperties, "irot");
+    if (!irotProp != !(image->transformFlags & AVIF_TRANSFORM_IROT) || (irotProp && irotProp->u.irot.angle != image->irot.angle)) {
+        avifDiagnosticsPrintf(&decoder->diag, "Rotation property mismatch between input items of tone-mapping derived image item");
+        return AVIF_RESULT_DECODE_GAIN_MAP_FAILED;
+    }
+    const avifProperty * imirProp = avifPropertyArrayFind(gainMapProperties, "imir");
+    if (!imirProp != !(image->transformFlags & AVIF_TRANSFORM_IMIR) || (imirProp && imirProp->u.imir.axis != image->imir.axis)) {
+        avifDiagnosticsPrintf(&decoder->diag, "Mirroring property mismatch between input items of tone-mapping derived image item");
+        return AVIF_RESULT_DECODE_GAIN_MAP_FAILED;
+    }
     return AVIF_RESULT_OK;
 }
 #endif // AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP
@@ -4981,6 +5055,9 @@ avifResult avifDecoderReset(avifDecoder * decoder)
 
     avifCodecType colorCodecType = AVIF_CODEC_TYPE_UNKNOWN;
     const avifPropertyArray * colorProperties = NULL;
+#if defined(AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP)
+    const avifPropertyArray * gainMapProperties = NULL;
+#endif
     if (data->source == AVIF_DECODER_SOURCE_TRACKS) {
         avifTrack * colorTrack = NULL;
         avifTrack * alphaTrack = NULL;
@@ -5342,6 +5419,7 @@ avifResult avifDecoderReset(avifDecoder * decoder)
             AVIF_CHECKRES(avifReadCodecConfigProperty(decoder->image->gainMap->image,
                                                       &mainItems[AVIF_ITEM_GAIN_MAP]->properties,
                                                       codecType[AVIF_ITEM_GAIN_MAP]));
+            gainMapProperties = &mainItems[AVIF_ITEM_GAIN_MAP]->properties;
         }
 #endif
     }
@@ -5405,6 +5483,11 @@ avifResult avifDecoderReset(avifDecoder * decoder)
         decoder->image->transformFlags |= AVIF_TRANSFORM_IMIR;
         decoder->image->imir = imirProp->u.imir;
     }
+#if defined(AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP)
+    if (gainMapProperties != NULL) {
+        AVIF_CHECKRES(aviDecoderCheckGainMapProperties(decoder, gainMapProperties));
+    }
+#endif
 
     if (!data->cicpSet && (data->tiles.count > 0)) {
         avifTile * firstTile = &data->tiles.tile[0];
