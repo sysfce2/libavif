@@ -10,6 +10,7 @@ The changes are relative to the previous release, unless the baseline is specifi
 
 ### Added since 1.4.2
 
+* Add the ignoreICC option to avifDecoder
 * avifenc: add --ignore-alpha flag to discard alpha channel on encode
 * avifgainmaputil: add --ignore-alpha flag to discard alpha channel
 
@@ -25,6 +26,9 @@ The changes are relative to the previous release, unless the baseline is specifi
 * Fix printed gain map size in avifenc when converting a jpeg with a gain map
   and using --grid.
 * Allow setting avifDecoder::imageSizeLimit to any value.
+* avifdec: The message "[--ignore-icc] Discarding ICC profile.\n" won't be
+  printed if the --ignore-icc or --icc option is specified and the image has an
+  ICC profile.
 
 ## [1.4.2] - 2026-05-26
 
