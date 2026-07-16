@@ -5289,10 +5289,9 @@ avifResult avifDecoderParse(avifDecoder * decoder)
 {
     avifDiagnosticsClearError(&decoder->diag);
 
-    // Color only or alpha only is not currently supported.
-    if ((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) != 0 &&
-        (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) != AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) {
-        avifDiagnosticsPrintf(&decoder->diag, "imageContentToDecode set to only color or only alpha is not supported");
+    // Alpha only is not currently supported.
+    if ((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) == AVIF_IMAGE_CONTENT_ALPHA) {
+        avifDiagnosticsPrintf(&decoder->diag, "imageContentToDecode set to only alpha is not supported");
         return AVIF_RESULT_NOT_IMPLEMENTED;
     }
     if (!decoder->io || !decoder->io->read) {
@@ -6097,10 +6096,9 @@ avifResult avifDecoderReset(avifDecoder * decoder)
 
     memset(&decoder->ioStats, 0, sizeof(decoder->ioStats));
 
-    // Color only or alpha only is not currently supported.
-    if ((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) != 0 &&
-        (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) != AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) {
-        avifDiagnosticsPrintf(&decoder->diag, "imageContentToDecode set to only color or only alpha is not supported");
+    // Alpha only is not currently supported.
+    if ((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) == AVIF_IMAGE_CONTENT_ALPHA) {
+        avifDiagnosticsPrintf(&decoder->diag, "imageContentToDecode set to only alpha is not supported");
         return AVIF_RESULT_NOT_IMPLEMENTED;
     }
 
@@ -6221,16 +6219,19 @@ avifResult avifDecoderReset(avifDecoder * decoder)
         }
 
         const uint8_t operatingPoint = 0; // No way to set operating point via tracks
-        avifTile * colorTile = avifDecoderDataCreateTile(data, colorCodecType, colorTrack->width, colorTrack->height, operatingPoint);
-        AVIF_CHECKERR(colorTile != NULL, AVIF_RESULT_OUT_OF_MEMORY);
-        AVIF_CHECKRES(avifCodecDecodeInputFillFromSampleTable(colorTile->input,
-                                                              colorTrack->sampleTable,
-                                                              decoder->imageCountLimit,
-                                                              decoder->io->sizeHint,
-                                                              data->diag));
-        data->tileInfos[AVIF_ITEM_COLOR].tileCount = 1;
+        avifTile * colorTile = NULL;
+        if (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR) {
+            colorTile = avifDecoderDataCreateTile(data, colorCodecType, colorTrack->width, colorTrack->height, operatingPoint);
+            AVIF_CHECKERR(colorTile != NULL, AVIF_RESULT_OUT_OF_MEMORY);
+            AVIF_CHECKRES(avifCodecDecodeInputFillFromSampleTable(colorTile->input,
+                                                                  colorTrack->sampleTable,
+                                                                  decoder->imageCountLimit,
+                                                                  decoder->io->sizeHint,
+                                                                  data->diag));
+            data->tileInfos[AVIF_ITEM_COLOR].tileCount = 1;
+        }
 
-        if (alphaTrack) {
+        if (alphaTrack && (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_ALPHA)) {
             avifTile * alphaTile = avifDecoderDataCreateTile(data, alphaCodecType, alphaTrack->width, alphaTrack->height, operatingPoint);
             AVIF_CHECKERR(alphaTile != NULL, AVIF_RESULT_OUT_OF_MEMORY);
             AVIF_CHECKRES(avifCodecDecodeInputFillFromSampleTable(alphaTile->input,
@@ -6247,7 +6248,31 @@ avifResult avifDecoderReset(avifDecoder * decoder)
 
         // Image sequence timing
         decoder->imageIndex = -1;
-        decoder->imageCount = (int)colorTile->input->samples.count;
+        uint32_t imageCount;
+        if (colorTile) {
+            imageCount = colorTile->input->samples.count;
+        } else {
+            imageCount = 0;
+            for (uint32_t chunkIndex = 0; chunkIndex < colorTrack->sampleTable->chunks.count; ++chunkIndex) {
+                // First, figure out how many samples are in this chunk
+                uint32_t sampleCount = avifGetSampleCountOfChunk(&colorTrack->sampleTable->sampleToChunks, chunkIndex);
+                if (sampleCount == 0) {
+                    // chunks with 0 samples are invalid
+                    avifDiagnosticsPrintf(data->diag, "Sample table contains a chunk with 0 samples");
+                    return AVIF_RESULT_BMFF_PARSE_FAILED;
+                }
+                if (imageCount > UINT32_MAX - sampleCount) {
+                    avifDiagnosticsPrintf(data->diag, "Total number of samples exceeds UINT32_MAX");
+                    return AVIF_RESULT_BMFF_PARSE_FAILED;
+                }
+                imageCount += sampleCount;
+            }
+        }
+        if (imageCount > INT_MAX) {
+            avifDiagnosticsPrintf(data->diag, "Total number of samples exceeds INT_MAX");
+            return AVIF_RESULT_BMFF_PARSE_FAILED;
+        }
+        decoder->imageCount = (int)imageCount;
         decoder->timescale = colorTrack->mediaTimescale;
         decoder->durationInTimescales = colorTrack->mediaDuration;
         if (colorTrack->mediaTimescale) {
@@ -6334,7 +6359,7 @@ avifResult avifDecoderReset(avifDecoder * decoder)
 
         // AVIF_ITEM_SAMPLE_TRANSFORM (not used through mainItems because not a coded item (well grids are not coded items either but it's different)).
         avifDecoderItem * const sampleTransformItem = avifDecoderDataFindSampleTransformImageItem(data);
-        if ((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) &&
+        if ((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR) &&
             (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS) && sampleTransformItem != NULL) {
             AVIF_ASSERT_OR_RETURN(data->sampleTransformNumInputImageItems == 0);
 
@@ -6399,6 +6424,9 @@ avifResult avifDecoderReset(avifDecoder * decoder)
                                                           &codecType[*category]));
 
                 // Optional alpha auxiliary item
+                if (!(decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_ALPHA)) {
+                    continue;
+                }
                 avifBool isAlphaInputImageItemInInput = AVIF_FALSE;
                 AVIF_CHECKRES(avifMetaFindAlphaItem(data->meta,
                                                     mainItems[*category],
@@ -6465,13 +6493,19 @@ avifResult avifDecoderReset(avifDecoder * decoder)
 
             AVIF_CHECKRES(avifDecoderAdoptGridTileCodecTypeIfNeeded(decoder, mainItems[c], &data->tileInfos[c]));
 
-            if (c == AVIF_ITEM_COLOR || c == AVIF_ITEM_ALPHA) {
-                if (!(decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA)) {
+            if (c == AVIF_ITEM_COLOR) {
+                if (!(decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR)) {
                     continue;
                 }
-            } else if (c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_0_COLOR || c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_1_COLOR ||
-                       c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_0_ALPHA || c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_1_ALPHA) {
-                AVIF_ASSERT_OR_RETURN((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA) &&
+            } else if (c == AVIF_ITEM_ALPHA) {
+                if (!(decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_ALPHA)) {
+                    continue;
+                }
+            } else if (c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_0_COLOR || c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_1_COLOR) {
+                AVIF_ASSERT_OR_RETURN((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR) &&
+                                      (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS));
+            } else if (c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_0_ALPHA || c == AVIF_ITEM_SAMPLE_TRANSFORM_INPUT_1_ALPHA) {
+                AVIF_ASSERT_OR_RETURN((decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_ALPHA) &&
                                       (decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS));
             } else {
                 AVIF_ASSERT_OR_RETURN(c == AVIF_ITEM_GAIN_MAP);
@@ -6965,7 +6999,10 @@ static avifResult avifDecoderApplySampleTransform(const avifDecoder * decoder, a
     }
 
     AVIF_CHECKRES(avifDecoderApplySampleTransformForPlanes(decoder, AVIF_PLANES_YUV, dstImage));
-    if (decoder->alphaPresent) {
+    // If decoder->data->tileInfos[AVIF_ITEM_ALPHA].tileCount == 0, it means
+    // decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_ALPHA was equal to 0.
+    // Only apply Sample Transforms for the alpha plane if there is an alpha item to apply it onto.
+    if (decoder->data->tileInfos[AVIF_ITEM_ALPHA].tileCount != 0) {
         AVIF_CHECKRES(avifDecoderApplySampleTransformForPlanes(decoder, AVIF_PLANES_A, dstImage));
     }
     return AVIF_RESULT_OK;
@@ -7040,7 +7077,7 @@ avifResult avifDecoderNextImage(avifDecoder * decoder)
     }
 
     // If decoder->data->tileInfos[AVIF_ITEM_COLOR].tileCount == 0, it means
-    // decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA was equal to 0.
+    // decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR was equal to 0.
     // Only apply Sample Transforms if there is a color item to apply it onto.
     if (decoder->data->tileInfos[AVIF_ITEM_COLOR].tileCount != 0 && decoder->data->meta->sampleTransformExpression.count > 0) {
         AVIF_CHECKRES(avifDecoderApplySampleTransform(decoder, decoder->image));
@@ -7215,7 +7252,7 @@ static uint32_t avifGetDecodedRowCount(const avifDecoder * decoder, const avifTi
 uint32_t avifDecoderDecodedRowCount(const avifDecoder * decoder)
 {
     if (decoder->data->tileInfos[AVIF_ITEM_COLOR].tileCount == 0) {
-        // decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR_AND_ALPHA
+        // decoder->imageContentToDecode & AVIF_IMAGE_CONTENT_COLOR
         // was likely 0 when avifDecoderNextImage() was called.
         // avifDecoderDecodedRowCount() only describes decoder->image->yuvPlanes[0].
         // There is no available luma plane, so return 0 decoded rows.
