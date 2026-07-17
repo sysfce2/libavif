@@ -169,6 +169,8 @@ avifResult SwapBaseCommand::Run() {
   }
   decoder->imageContentToDecode |= AVIF_IMAGE_CONTENT_GAIN_MAP;
   decoder->ignoreICC = arg_image_read_.ignore_profile;
+  decoder->ignoreExif = arg_image_read_.ignore_exif;
+  decoder->ignoreXMP = arg_image_read_.ignore_xmp;
   avifResult result = ReadAvif(decoder.get(), arg_input_filename_);
   if (result != AVIF_RESULT_OK) {
     return result;
